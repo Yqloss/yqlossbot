@@ -446,24 +446,27 @@ class Bot:
             return True
         else:
             return default == 'whitelist'
-    def _have_permission(self, main, message, list_):
-        if not self._have_permission_single(
-            message.group,
-            list_['group_whitelist'],
-            list_['group_blacklist'],
-            list_['group_default']):
-            return False
-        elif not self._have_permission_single(
-            message.user,
-            list_['user_whitelist'],
-            list_['user_blacklist'],
-            list_['user_default']):
-            return False
-        return True
     def have_permission(self, main, message):
+        group_whitelist = []
+        group_blacklist = []
+        user_whitelist = []
+        user_blacklist = []
+        group_default = 'whitelist'
+        user_default = 'whitelist'
         for list_name in main.options.get(f'bots.{self.name}.lists'):
-            if not self._have_permission(main, message, main.options.get(f'lists.{list_name}')):
-                return False
+            lst = main.options.get(f'lists.{list_name}', {})
+            group_whitelist += lst.get('group_whitelist', [])
+            group_blacklist += lst.get('group_blacklist', [])
+            user_whitelist += lst.get('user_whitelist', [])
+            user_blacklist += lst.get('user_blacklist', [])
+            if lst.get('group_default', 'blacklist') != 'whitelist':
+                group_default = 'blacklist'
+            if lst.get('user_default', 'blacklist') != 'whitelist':
+                user_default = 'blacklist'
+        if not self._have_permission_single(message.group, group_whitelist, group_blacklist, group_default):
+            return False
+        if not self._have_permission_single(message.user, user_whitelist, user_blacklist, user_default):
+            return False
         return True
     def can_process(self, main, message):
         return False
