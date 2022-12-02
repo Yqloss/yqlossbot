@@ -8,6 +8,8 @@ import time
 import traceback
 import base64
 import random
+from io import BytesIO
+from PIL import Image
 class Consts:
     BUFFER_SIZE = 1048576
     ADDRESS_SEND_HOST = '127.0.0.1:5700'
@@ -15,6 +17,10 @@ class Consts:
     ADDRESS_SEND_GROUP = f'http://{ADDRESS_SEND_HOST}/send_group_msg?group_id=%s&message=%s'
     ADDRESS_RECALL_MESSAGE = f'http://{ADDRESS_SEND_HOST}/delete_msg?message_id=%s'
     ADDRESS_RECV = ('', 5701)
+    RE_USERNAME = re.compile(r'[A-Za-z0-9_]{1,16}')
+    RE_UUID = re.compile(r'([A-Fa-f0-9]{32})|([A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12})')
+    RE_QQNUMBER = re.compile(r'\d{5,}')
+    RE_GUILDNAME = re.compile(r'[A-Za-z0-9\x20]{1,32}')
     RE_NEWLINE = re.compile(r'[\n\x20]*\n[\n\x20]*')
     RE_STYLE = re.compile(r'\u00a7.')
     PREFIX = f'[__INTERNALPREFIX{time.time()}__]'
@@ -39,9 +45,11 @@ class Utils:
         return json_obj.get('message_id', 0)
     @staticmethod
     def send_private(number, message):
+        if not message: return
         return Utils._send(Consts.ADDRESS_SEND_PRIVATE % (number, HttpRequest.encode(message)))
     @staticmethod
     def send_group(number, message):
+        if not message: return
         return Utils._send(Consts.ADDRESS_SEND_GROUP % (number, HttpRequest.encode(message)))
     @staticmethod
     def recall_message(message):
@@ -185,7 +193,7 @@ class Utils:
                 elif value_name.endswith('^'):
                     string_format = Utils.string_to_camel
                     value_name = value_name[:-1]
-                value = Utils.get(message.data, value_name, default)
+                value = message.get(value_name, default)
                 if time_format is not None and isinstance(value, int):
                     value = time_format(value)
                 elif string_format is not None and isinstance(value, str):
@@ -234,6 +242,15 @@ class Utils:
                     ret_full_exp = level_exp_name
                     break
             return int(ret_level), int(ret_exp), ret_full_exp
+    @staticmethod
+    def get_image(binary, crop=None):
+        bytesio = BytesIO(binary)
+        image = Image.open(bytesio)
+        image = image.convert('RGB')
+        image = image.resize((92, 44), resample=Image.Resampling.NEAREST)
+        if crop is not None:
+            image = image.crop(crop)
+        return image
 class BotException(Exception):
     def __init__(self, reason):
         if isinstance(reason, BotException):
@@ -363,6 +380,7 @@ class HttpServer:
 class Options:
     def __init__(self, file_name, default_options):
         self.file_name = file_name
+        self.default_options = Utils.copy(default_options)
         self.options = default_options
         self._read_options()
         self.write_options()
@@ -414,6 +432,10 @@ class Message:
         return f'[CQ:reply,id={self.id}]'
     def at(self):
         return f'[CQ:at,qq={self.user}]'
+    def get(self, path, default=None):
+        return Utils.get(self.data, path, default=default)
+    def set(self, path, value):
+        Utils.set(self.data, path, value)
 class Bot:
     def __init__(self, name):
         self.name = name
@@ -715,6 +737,24 @@ class Maps:
         (2500000, '2.5m'),
         (3000000, '3m')
     )
+    OFCAPE_DESIGN = {
+        '852C2C5E1C1CE29F00441616': 'Standard',
+        'F8F8F8DDDDDDFFFFFFC8C8C8': 'White',
+        '8585855E5E5ECECECE444444': 'Gray',
+        '1E1E1E010101404040202020': 'Black',
+        '8500005E0000E20000440000': 'Red',
+        '008500005E0000E200004400': 'Green',
+        '00008500005E4040FF000044': 'Blue',
+        'F2F200CACA00FFFF00BEBE00': 'Yellow',
+        '8500855E005EE200E2440044': 'Purple',
+        '008585005E5E00E2E2004444': 'Cyan'
+    }
+    OFCAPE_ALIGN = {
+        's': 'Scale',
+        't': 'Top',
+        'm': 'Middle',
+        'b': 'Bottom'
+    }
 class Pipes:
     LAST_COMMAND = 0.0
     @staticmethod
@@ -726,19 +766,28 @@ class Pipes:
             else:
                 raise BotException('使用指令过快!')
     @staticmethod
-    def api(name, success_flag=None, test_key=None, *args):
+    def _api(name, requester, response_processor, *args):
         def _(main, message):
-            api_url = Utils.get(message.data, f'apiset.{name}', '')
-            url_args = tuple([Utils.get(message.data, arg, '') for arg in args])
+            api_url = message.get(f'apiset.{name}', '')
+            url_args = tuple([message.get(arg, '') for arg in args])
             if len(url_args) == 0:
                 url = api_url
             elif len(url_args) == 1:
                 url = api_url % url_args[0]
             else:
                 url = api_url % url_args
-            response = requests.get(url, headers={'User-Agent': Utils.get(message.data, 'user_agent', '')})
-            if response.status_code != 200:
-                raise BotException('API %s 查询失败! (HTTP %d)' % (name, response.status_code))
+            response = requester(url, headers={'User-Agent': message.get('user_agent', '')})
+            data = response_processor(response)
+            message.data['api_%s' % name] = data
+        return _
+    @staticmethod
+    def _api_status(name, response, code=200):
+        if response.status_code != code:
+            raise BotException('API %s 查询失败! (HTTP %d)' % (name, response.status_code))
+    @staticmethod
+    def api(name, success_flag=None, test_key=None, *args):
+        def _(response):
+            Pipes._api_status(name, response, 200)
             data = json.loads(response.content.decode('utf-8'))
             if success_flag is not None:
                 if not Utils.get(data, success_flag, False):
@@ -746,7 +795,35 @@ class Pipes:
             if test_key is not None:
                 if Utils.get(data, test_key) is None:
                     raise BotException('API %s 查询失败! (None)' % name)
-            message.data['api_%s' % name] = data
+            return data
+        return Pipes._api(name, requests.get, _, *args)
+    @staticmethod
+    def api_binary(name, *args):
+        def _(response):
+            Pipes._api_status(name, response, 200)
+            return response.content
+        return Pipes._api(name, requests.get, _, *args)
+    @staticmethod
+    def api_optifine_format():
+        def _requester(url, headers):
+            url, name = url.split('&&')
+            return requests.post(url, data=f'username={name}', headers={**headers, 'Content-Type': 'application/x-www-form-urlencoded'}, allow_redirects=False)
+        def _processer(response):
+            if response.status_code != 302:
+                return None
+            location = response.headers.get('Location', '')
+            index_equal = location.find('=')
+            index_and = location.find('&')
+            if not location or index_equal == -1 or index_and == -1 or index_equal >= index_and:
+                return None
+            return location[index_equal + 1:index_and]
+        return Pipes._api('optifine_format', _requester, _processer, 'api_mojang_profile.name')
+    @staticmethod
+    def re_expression(exp, arg, error_msg):
+        def _(main, message):
+            value = message.get(arg)
+            if not isinstance(value, str) or not exp.fullmatch(value):
+                raise BotException(error_msg)
         return _
     @staticmethod
     def replace(mapping):
@@ -756,53 +833,51 @@ class Pipes:
     @staticmethod
     def plus(value_a, value_b, result):
         def _(main, message):
-            Utils.set(message.data, result,
-                Utils.get(message.data, value_a, 0) +
-                Utils.get(message.data, value_b, 0))
+            message.set(result, message.get(value_a, 0) + message.get(value_b, 0))
         return _
     @staticmethod
     def game_mode(mode_map, mode_arg, arg='args.2', placeholder='!', placeholder_bridge='`'):
         def _(main, message):
-            mode_name = Utils.get(message.data, arg, None)
+            mode_name = message.get(arg, None)
             if mode_name in mode_map:
                 mode = mode_map[mode_name]
                 message.placeholders[placeholder] = mode[0]
                 message.placeholders[placeholder_bridge] = mode[1]
-                Utils.set(message.data, mode_arg, mode[2])
+                message.set(mode_arg, mode[2])
             else:
                 raise BotException('未知的模式!')
         return _
     @staticmethod
     def session(main, message):
-        properties = Utils.get(message.data, 'api_mojang_session.properties', [])
+        properties = message.get('api_mojang_session.properties', [])
         for property in properties:
             if property.get('name', '') == 'textures':
                 value = json.loads(base64.b64decode(property.get('value', '')).decode())
-                Utils.set(message.data, 'session.skin', Utils.get(value, 'textures.SKIN.url', '默认'))
+                message.set('session.skin', Utils.get(value, 'textures.SKIN.url', '默认'))
                 if Utils.get(value, 'textures.SKIN.metadata.model') == 'slim':
-                    Utils.set(message.data, 'session.model', '纤细 (Alex)')
+                    message.set('session.model', '纤细 (Alex)')
                 else:
-                    Utils.set(message.data, 'session.model', '默认 (Steve)')
+                    message.set('session.model', '默认 (Steve)')
                 cape = Utils.get(value, 'textures.CAPE.url')
                 if cape is None:
-                    Utils.set(message.data, 'session.cape', '无')
+                    message.set('session.cape', '无')
                 else:
                     cape = Maps.CAPE.get(cape, cape)
-                    Utils.set(message.data, 'session.cape', cape)
+                    message.set('session.cape', cape)
                 break
     @staticmethod
     def hypixel(main, message):
-        uuid = Utils.get(message.data, 'api_mojang_profile.id')
-        username = Utils.get(message.data, 'api_hypixel_player.player.displayname')
-        username_mojang = Utils.get(message.data, 'api_mojang_profile.name')
+        uuid = message.get('api_mojang_profile.id')
+        username = message.get('api_hypixel_player.player.displayname')
+        username_mojang = message.get('api_mojang_profile.name')
         custom_rank = main.options.get(f'options.hypixel.ranks.{uuid}')
         rank = ''
         rank_raw = 'NONE'
-        rank_prefix = Utils.get(message.data, 'api_hypixel_player.player.prefix')
-        rank_rank = Utils.get(message.data, 'api_hypixel_player.player.rank')
-        rank_monthly = Utils.get(message.data, 'api_hypixel_player.player.monthlyPackageRank')
-        rank_new = Utils.get(message.data, 'api_hypixel_player.player.newPackageRank')
-        rank_package = Utils.get(message.data, 'api_hypixel_player.player.packageRank')
+        rank_prefix = message.get('api_hypixel_player.player.prefix')
+        rank_rank = message.get('api_hypixel_player.player.rank')
+        rank_monthly = message.get('api_hypixel_player.player.monthlyPackageRank')
+        rank_new = message.get('api_hypixel_player.player.newPackageRank')
+        rank_package = message.get('api_hypixel_player.player.packageRank')
         if rank_prefix is not None:
             rank, rank_raw = Utils.reset_style(rank_prefix) + ' ', 'CUSTOM'
         elif rank_rank in Maps.RANK:
@@ -815,29 +890,29 @@ class Pipes:
             rank, rank_raw = Maps.RANK[rank_package], rank_package
         if custom_rank is not None:
             rank = custom_rank.replace('{rank}', rank)
-        Utils.set(message.data, 'hypixel.name', rank + username)
-        Utils.set(message.data, 'hypixel.rank_raw', rank_raw)
+        message.set('hypixel.name', rank + username)
+        message.set('hypixel.rank_raw', rank_raw)
         if username != username_mojang:
-            Utils.set(message.data, 'hypixel.name_change', f'\n此玩家已改名! ({username} -> {username_mojang})')
+            message.set('hypixel.name_change', f'\n此玩家已改名! ({username} -> {username_mojang})')
         else:
-            Utils.set(message.data, 'hypixel.name_change', '')
+            message.set('hypixel.name_change', '')
     @staticmethod
     def command_hypixel(main, message):
-        rank_raw = Utils.get(message.data, 'hypixel.rank_raw', 'NONE')
-        hypixel_exp = Utils.get(message.data, 'api_hypixel_player.player.networkExp', 0.0)
+        rank_raw = message.get('hypixel.rank_raw', 'NONE')
+        hypixel_exp = message.get('api_hypixel_player.player.networkExp', 0.0)
         hypixel_level = (0.0008 * hypixel_exp + 12.25) ** 0.5 - 2.5
-        rank_prefix_color = Utils.get(message.data, 'api_hypixel_player.player.monthlyRankColor', 'GOLD')
-        rank_plus_color = Utils.get(message.data, 'api_hypixel_player.player.rankPlusColor', 'RED')
+        rank_prefix_color = message.get('api_hypixel_player.player.monthlyRankColor', 'GOLD')
+        rank_plus_color = message.get('api_hypixel_player.player.rankPlusColor', 'RED')
         rank_color_line = ''
         if rank_raw == 'MVP_PLUS':
             rank_color_line = f'\nMVP+ 颜色: {Maps.PLUS_COLOR.get(rank_plus_color, rank_plus_color)}'
         elif rank_raw == 'SUPERSTAR':
             rank_color_line = f'\nMVP 颜色: {Maps.PREFIX_COLOR.get(rank_prefix_color, rank_prefix_color)} | ++ 颜色: {Maps.PLUS_COLOR.get(rank_plus_color, rank_plus_color)}'
-        Utils.set(message.data, 'hypixel.level', hypixel_level)
-        Utils.set(message.data, 'hypixel.rank_color', rank_color_line)
+        message.set('hypixel.level', hypixel_level)
+        message.set('hypixel.rank_color', rank_color_line)
     @staticmethod
     def command_bedwars(main, message):
-        bedwars_total_exp = Utils.get(message.data, 'api_hypixel_player.player.stats.Bedwars.Experience', 0)
+        bedwars_total_exp = message.get('api_hypixel_player.player.stats.Bedwars.Experience', 0)
         bedwars_level = 100 * (bedwars_total_exp // 487000)
         bedwars_exp = 0
         bedwars_full_exp = '0'
@@ -854,28 +929,28 @@ class Pipes:
             bedwars_level, bedwars_exp, bedwars_full_exp = bedwars_level + 4 + (bedwars_total_exp - 7000) // 5000, (bedwars_total_exp - 7000) % 5000, '5k'
         bedwars_level = int(bedwars_level)
         bedwars_exp = int(bedwars_exp)
-        bedwars_shop = Utils.get(message.data, 'api_hypixel_player.player.stats.Bedwars.favourites_2', Consts.DEFAULT_SHOP).split(',')
-        bedwars_slots = Utils.get(message.data, 'api_hypixel_player.player.stats.Bedwars.favorite_slots', Consts.DEFAULT_SLOTS).split(',')
-        Utils.set(message.data, 'bedwars.shop',
+        bedwars_shop = message.get('api_hypixel_player.player.stats.Bedwars.favourites_2', Consts.DEFAULT_SHOP).split(',')
+        bedwars_slots = message.get('api_hypixel_player.player.stats.Bedwars.favorite_slots', Consts.DEFAULT_SLOTS).split(',')
+        message.set('bedwars.shop',
             Utils.format_shop(Maps.FAVORITE, bedwars_shop[:7]) +
             Utils.format_shop(Maps.FAVORITE, bedwars_shop[7:14]) +
             Utils.format_shop(Maps.FAVORITE, bedwars_shop[14:]))
-        Utils.set(message.data, 'bedwars.slots', Utils.format_shop(Maps.FAVORITE, bedwars_slots))
-        Utils.set(message.data, 'bedwars.level', str(bedwars_level))
-        Utils.set(message.data, 'bedwars.level_int', bedwars_level)
-        Utils.set(message.data, 'bedwars.star', '\u272b' if bedwars_level < 1100 else '\u272a' if bedwars_level < 2100 else '\u269d')
-        Utils.set(message.data, 'bedwars.exp', bedwars_exp)
-        Utils.set(message.data, 'bedwars.full_exp', bedwars_full_exp)
+        message.set('bedwars.slots', Utils.format_shop(Maps.FAVORITE, bedwars_slots))
+        message.set('bedwars.level', str(bedwars_level))
+        message.set('bedwars.level_int', bedwars_level)
+        message.set('bedwars.star', '\u272b' if bedwars_level < 1100 else '\u272a' if bedwars_level < 2100 else '\u269d')
+        message.set('bedwars.exp', bedwars_exp)
+        message.set('bedwars.full_exp', bedwars_full_exp)
     @staticmethod
     def command_skywars(main, message):
-        skywars_total_exp = int(Utils.get(message.data, 'api_hypixel_player.player.stats.SkyWars.skywars_experience', 0))
+        skywars_total_exp = int(message.get('api_hypixel_player.player.stats.SkyWars.skywars_experience', 0))
         skywars_level = 0
         skywars_exp = skywars_total_exp
         skywars_full_exp = '0'
-        skywars_icon = Utils.get(message.data, 'api_hypixel_player.player.stats.SkyWars.selected_prestige_icon', 'default')
-        skywars_corrupt = Utils.get(message.data, 'api_hypixel_player.player.stats.SkyWars.angel_of_death_level', 0)
-        skywars_angels_offering = Utils.get(message.data, 'api_hypixel_player.player.stats.SkyWars.angels_offering', 0) > 0
-        skywars_favor_of_the_angel = 'favor_of_the_angel' in Utils.get(message.data, 'api_hypixel_player.player.stats.SkyWars.packages', [])
+        skywars_icon = message.get('api_hypixel_player.player.stats.SkyWars.selected_prestige_icon', 'default')
+        skywars_corrupt = message.get('api_hypixel_player.player.stats.SkyWars.angel_of_death_level', 0)
+        skywars_angels_offering = message.get('api_hypixel_player.player.stats.SkyWars.angels_offering', 0) > 0
+        skywars_favor_of_the_angel = 'favor_of_the_angel' in message.get('api_hypixel_player.player.stats.SkyWars.packages', [])
         skywars_corrupt_suffix = ''
         if skywars_angels_offering:
             if skywars_favor_of_the_angel:
@@ -889,39 +964,79 @@ class Pipes:
         if skywars_favor_of_the_angel:
             skywars_corrupt += 1
         skywars_level, skywars_exp, skywars_full_exp = Utils.get_level(skywars_total_exp, Maps.SKYWARS_LEVELS)
-        Utils.set(message.data, 'skywars.level', skywars_level)
-        Utils.set(message.data, 'skywars.exp', skywars_exp)
-        Utils.set(message.data, 'skywars.full_exp', skywars_full_exp)
-        Utils.set(message.data, 'skywars.star', Maps.SKYWARS_STAR.get(skywars_icon, '?'))
-        Utils.set(message.data, 'skywars.corrupt', '%d%%%s' % (skywars_corrupt, skywars_corrupt_suffix))
+        message.set('skywars.level', skywars_level)
+        message.set('skywars.exp', skywars_exp)
+        message.set('skywars.full_exp', skywars_full_exp)
+        message.set('skywars.star', Maps.SKYWARS_STAR.get(skywars_icon, '?'))
+        message.set('skywars.corrupt', '%d%%%s' % (skywars_corrupt, skywars_corrupt_suffix))
     @staticmethod
     def command_guild(api):
         def _(main, message):
-            members = Utils.get(message.data, f'api_hypixel_guild_{api}.guild.members', [])
-            exp = Utils.get(message.data, f'api_hypixel_guild_{api}.guild.exp', 0)
-            tag_color = Utils.get(message.data, f'api_hypixel_guild_{api}.guild.tagColor')
-            preferred_games = Utils.get(message.data, f'api_hypixel_guild_{api}.guild.preferredGames', [])
+            members = message.get(f'api_hypixel_guild_{api}.guild.members', [])
+            exp = message.get(f'api_hypixel_guild_{api}.guild.exp', 0)
+            tag_color = message.get(f'api_hypixel_guild_{api}.guild.tagColor')
+            preferred_games = message.get(f'api_hypixel_guild_{api}.guild.preferredGames', [])
             level, guild_exp, full_exp = Utils.get_level(exp, Maps.GUILD_LEVELS)
             level -= 1
-            Utils.set(message.data, 'guild.member_count', len(members))
-            Utils.set(message.data, 'guild.level', level)
-            Utils.set(message.data, 'guild.exp', guild_exp)
-            Utils.set(message.data, 'guild.full_exp', full_exp)
-            Utils.set(message.data, 'guild.double_exp', min(100, level // 3 * 2 + level % 3))
-            Utils.set(message.data, 'guild.double_coins', min(100, level // 3))
-            Utils.set(message.data, 'guild.tag_color', Maps.GUILD_TAG_COLOR.get(tag_color, tag_color))
-            Utils.set(message.data, 'guild.preferred_games', ', '.join([Utils.string_to_camel(game) for game in preferred_games]) if preferred_games else '无')
+            message.set('guild.member_count', len(members))
+            message.set('guild.level', level)
+            message.set('guild.exp', guild_exp)
+            message.set('guild.full_exp', full_exp)
+            message.set('guild.double_exp', min(100, level // 3 * 2 + level % 3))
+            message.set('guild.double_coins', min(100, level // 3))
+            message.set('guild.tag_color', Maps.GUILD_TAG_COLOR.get(tag_color, tag_color))
+            message.set('guild.preferred_games', ', '.join([Utils.string_to_camel(game) for game in preferred_games]) if preferred_games else '无')
         return _
     @staticmethod
     def command_guild_player(main, message):
-        members = Utils.get(message.data, f'api_hypixel_guild_player.guild.members', [])
-        uuid = Utils.get(message.data, 'api_mojang_profile.id', 'Love')
+        members = message.get(f'api_hypixel_guild_player.guild.members', [])
+        uuid = message.get('api_mojang_profile.id', 'Love')
         for member in members:
             if member.get('uuid', 'Q_TT') == uuid:
-                Utils.set(message.data, 'guild.player', member)
-                Utils.set(message.data, 'guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
+                message.set('guild.player', member)
+                message.set('guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
                 break
+    @staticmethod
+    def _check_valign(main, message, valign, binary):
+        message.set('ofcape.valign', valign)
+        APIs.OPTIFINE_BANNER(main, message)
+        image_match = Utils.get_image(message.get('api_optifine_banner'), (2, 2, 22, 34))
+        return image_match.tobytes() == binary
+    @staticmethod
+    def command_optifine_cape(main, message):
+        name = message.get('api_mojang_profile.name', '')
+        image = Utils.get_image(message.get('api_optifine_cape'))
+        image_banner = image.crop((2, 2, 22, 34)).tobytes()
+        color_top = ''.join(map('%02X'.__mod__, image.getpixel((22, 2))))
+        color_bottom = ''.join(map('%02X'.__mod__, image.getpixel((22, 33))))
+        of_format = message.get('api_optifine_format')
+        if of_format is None:
+            color_text = ''.join(map('%02X'.__mod__, image.getpixel((6, 10))))
+            color_shadow = ''.join(map('%02X'.__mod__, image.getpixel((6, 12))))
+            colors = color_top + color_bottom + color_text + color_shadow
+            message.set('ofcape.design', Maps.OFCAPE_DESIGN.get(colors, 'Custom...'))
+            message.set('ofcape.custom', f'\nText: {color_text}\nShadow: {color_shadow}')
+            message.set('ofcape.banner', '')
+        else:
+            valign = 'b'
+            message.set('ofcape.url', of_format)
+            for va in 'stm':
+                if Pipes._check_valign(main, message, va, image_banner):
+                    valign = va
+                    break
+            if not Pipes._check_valign(main, message, valign, image_banner):
+                raise BotException('OptiFine 披风查询失败!')
+            align = Maps.OFCAPE_ALIGN.get(valign, 'Unknown')
+            message.set('ofcape.design', 'Banner...')
+            message.set('ofcape.banner', f'\nURL: {of_format}\nAlign: {align}')
+            message.set('ofcape.custom', '')
+        message.set('ofcape.top', color_top)
+        message.set('ofcape.bottom', color_bottom)
 class APIs:
+    RE_USERNAME = Pipes.re_expression(Consts.RE_USERNAME, 'args.1', '用户名格式错误!')
+    RE_UUID = Pipes.re_expression(Consts.RE_UUID, 'args.1', 'UUID 格式错误!')
+    RE_QQNUMBER = Pipes.re_expression(Consts.RE_QQNUMBER, 'args.1', 'QQ 号码格式错误!')
+    RE_GUILDNAME = Pipes.re_expression(Consts.RE_GUILDNAME, 'guild.name', '公会名格式错误!')
     MOJANG_PROFILE = Pipes.api('mojang_profile', None, 'id', 'args.1')
     MOJANG_SESSION_NAME = Pipes.api('mojang_session', None, 'id', 'api_mojang_profile.id')
     MOJANG_SESSION_UUID = Pipes.api('mojang_session', None, 'id', 'args.1')
@@ -934,6 +1049,10 @@ class APIs:
     ANTISNIPER_DENICK = Pipes.api('antisniper_denick', 'success', 'player.ign', 'apiset.antisniper_apikey', 'args.1')
     ANTISNIPER_FINDNICK = Pipes.api('antisniper_findnick', 'success', 'player.ign', 'apiset.antisniper_apikey', 'args.1')
     ANTISNIPER_WINSTREAK = Pipes.api('antisniper_winstreak', 'success', 'player.ign', 'apiset.antisniper_apikey', 'args.1')
+    OPTIFINE_CAPE = Pipes.api_binary('optifine_cape', 'api_mojang_profile.name')
+    OPTIFINE_BANNER = Pipes.api_binary('optifine_banner', 'ofcape.url', 'ofcape.valign')
+    OPTIFINE_FORMAT = Pipes.api_optifine_format()
+    QQAPI_QQAPI = Pipes.api('qqapi_qqapi', None, 'qq', 'args.1')
 class Main:
     def __init__(self):
         self.record_messages = {}
@@ -973,6 +1092,15 @@ class Main:
                 },
                 'admin': {
                     'lists': ['admin']
+                },
+                'hypixelinternal': {
+                    'lists': ['admin']
+                },
+                'qqapi': {
+                    'lists': ['admin']
+                },
+                'optifinecape': {
+                    'lists': ['admin']
                 }
             },
             'global': {
@@ -994,7 +1122,11 @@ class Main:
                         'antisniper_apikey': '',
                         'antisniper_denick': 'https://api.antisniper.net/denick?key=%s&nick=%s',
                         'antisniper_findnick': 'https://api.antisniper.net/findnick?key=%s&name=%s',
-                        'antisniper_winstreak': 'https://api.antisniper.net/winstreak?key=%s&name=%s'
+                        'antisniper_winstreak': 'https://api.antisniper.net/winstreak?key=%s&name=%s',
+                        'optifine_cape': 'http://s.optifine.net/capes/%s.png',
+                        'optifine_banner': 'http://optifine.net/showBanner?format=%s&valign=%s',
+                        'optifine_format': 'https://optifine.net/banners&&%s',
+                        'qqapi_qqapi': 'https://zy.xywlapi.cc/qqapi?qq=%s'
                     }
                 },
                 'using_apiset': 'default',
@@ -1060,20 +1192,22 @@ class Main:
             %sfindnick <玩家> 查找 Nick (Antisniper)
             %sws|winstreak <玩家> 查询起床战争普通模式连胜 (Antisniper)
             %swsall|winstreakall <玩家> 查询起床战争其他模式连胜 (Antisniper)
-        ''' % Utils.format(main, message, *(23 * ('prefix',)))))
+            %swshyp <玩家> 查询起床战争普通模式连胜 (Hypixel)
+            %swsallhyp <玩家> 查询起床战争其他模式连胜 (Hypixel)
+        ''' % Utils.format(main, message, *(25 * ('prefix',)))))
         def current_time():
             time_ = time.localtime()
             return time_.tm_yday * 191981 + time_.tm_year * 1145
         self.register_bot(BotCommand('luck', ('luck', 'yluck'), (Pipes.cooldown,), lambda main, message: Utils.last(
             random.seed(message.user * 14 + current_time()),
-            Utils.set(message.data, 'luck.from', main.options.get(f'options.luck.{message.user}', main.options.get(f'options.luck.default', [0, 100]))[0]),
-            Utils.set(message.data, 'luck.to', main.options.get(f'options.luck.{message.user}', main.options.get(f'options.luck.default', [0, 100]))[1]),
-            f'{message.at()}你今天的幸运值是 {random.randint(Utils.get(message.data, "luck.from", 0), Utils.get(message.data, "luck.to", 100))}%!'
+            message.set('luck.from', main.options.get(f'options.luck.{message.user}', main.options.get(f'options.luck.default', [0, 100]))[0]),
+            message.set('luck.to', main.options.get(f'options.luck.{message.user}', main.options.get(f'options.luck.default', [0, 100]))[1]),
+            f'{message.at()}你今天的幸运值是 {random.randint(message.get("luck.from", 0), message.get("luck.to", 100))}%!'
         )))
         self.register_bot(BotAutoreply('autoreply'))
-        self.register_bot(BotCommand('mcname', ('mc', 'minecraft', 'profile', 'skin', 'mcskin'), (Pipes.cooldown, APIs.MOJANG_PROFILE, APIs.MOJANG_SESSION_NAME, Pipes.session), message_profile))
-        self.register_bot(BotCommand('mcuuid', ('mcuuid', 'uuid'), (Pipes.cooldown, APIs.MOJANG_SESSION_UUID, Pipes.session), message_profile))
-        self.register_bot(BotCommand('hypixelinternal', ('__hypixelinternal',), (Pipes.cooldown,
+        self.register_bot(BotCommand('mcname', ('mc', 'minecraft', 'profile', 'skin', 'mcskin'), (Pipes.cooldown, APIs.RE_USERNAME, APIs.MOJANG_PROFILE, APIs.MOJANG_SESSION_NAME, Pipes.session), message_profile))
+        self.register_bot(BotCommand('mcuuid', ('mcuuid', 'uuid'), (Pipes.cooldown, APIs.RE_UUID, APIs.MOJANG_SESSION_UUID, Pipes.session), message_profile))
+        self.register_bot(BotCommand('hypixelinternal', ('__hypixelinternal',), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.command_hypixel,
             Pipes.replace({'[': 'api_hypixel_player.player.', '(': 'api_hypixel_player.player.achievements.general_'})
         ), lambda main, message: '''
@@ -1114,7 +1248,7 @@ class Main:
             - 今日封禁: %s
             - 总封禁: %s
         ''' % Utils.format(main, message, '[watchdog_lastMinute', '[watchdog_rollingDaily', '[watchdog_total', '[staff_rollingDaily', '[staff_total')))
-        self.register_bot(BotCommand('bedwars', ('bw', 'bedwar', 'bedwars'), (Pipes.cooldown,
+        self.register_bot(BotCommand('bedwars', ('bw', 'bedwar', 'bedwars'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.command_bedwars, Pipes.game_mode(Maps.MODE_BEDWARS, 'bedwars.mode'),
             Pipes.replace({'[': 'api_hypixel_player.player.stats.Bedwars.', ']': '_bedwars', ')': '_resources_collected_bedwars'})
         ), lambda main, message: '''
@@ -1132,7 +1266,7 @@ class Main:
             '!kills]', '!deaths]', '/', '!final_kills]', '!final_deaths]', '/',
             '!iron)', '!gold)', '!diamond)', '!emerald)', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('skywars', ('sw', 'skywar', 'skywars'), (Pipes.cooldown,
+        self.register_bot(BotCommand('skywars', ('sw', 'skywar', 'skywars'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.command_skywars, Pipes.replace({'[': 'api_hypixel_player.player.stats.SkyWars.'})
         ), lambda main, message: '''
             [%s%s] %s 的空岛战争数据:
@@ -1148,7 +1282,7 @@ class Main:
             '[coins', '[cosmetic_tokens', 'skywars.corrupt?', '[kills', '[deaths', '/',
             '[wins', '[losses', '/', '[souls', '[heads', '[assists', '[time_played&', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('megawalls', ('mw', 'megawall', 'megawalls'), (Pipes.cooldown,
+        self.register_bot(BotCommand('megawalls', ('mw', 'megawall', 'megawalls'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.replace({'[': 'api_hypixel_player.player.stats.Walls3.'})
         ), lambda main, message: '''
             %s 的超级战墙数据:
@@ -1161,7 +1295,7 @@ class Main:
             'hypixel.name?', '[coins', '[wither_damage', '[kills', '[deaths', '/', '[final_kills', '[final_deaths', '/',
             '[wins', '[losses', '/', '[assists', '[final_assists', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('duels', ('duel', 'duels'), (Pipes.cooldown,
+        self.register_bot(BotCommand('duels', ('duel', 'duels'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.game_mode(Maps.MODE_DUELS, 'duels.mode'),
             Pipes.replace({'[': 'api_hypixel_player.player.stats.Duels.'})
         ), lambda main, message: '''
@@ -1174,7 +1308,7 @@ class Main:
             'hypixel.name?', 'duels.mode?', '[coins', '!rounds_played', '?!melee_hits', '?!melee_swings', '%',
             '?!bow_hits', '?!bow_shots', '%', '`kills', '`deaths', '/', '!wins', '!losses', '/', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('blitz', ('bsg', 'blitz'), (Pipes.cooldown,
+        self.register_bot(BotCommand('blitz', ('bsg', 'blitz'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.plus(
                     'api_hypixel_player.player.stats.HungerGames.wins', 'api_hypixel_player.player.stats.HungerGames.deaths', 'blitz.games'
             ), Pipes.replace({'[': 'api_hypixel_player.player.stats.HungerGames.'})
@@ -1188,7 +1322,7 @@ class Main:
             'hypixel.name?', '[coins', '[wins', '[kills', '[deaths', '/',
             '?[kills', 'blitz.games', '/', '[time_played&', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('uhc', ('uhc',), (Pipes.cooldown,
+        self.register_bot(BotCommand('uhc', ('uhc',), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.plus(
                 'api_hypixel_player.player.stats.UHC.deaths', 'api_hypixel_player.player.stats.UHC.deaths_solo', 'uhc.deaths'
             ), Pipes.replace({'[': 'api_hypixel_player.player.stats.UHC.', '(': 'api_hypixel_player.player.achievements.uhc_'})
@@ -1201,7 +1335,7 @@ class Main:
             'hypixel.name?', '[coins', '[score', '(hunter', 'uhc.deaths', '/',
             '(champion', '(consumer', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('mm', ('mm', 'murder'), (Pipes.cooldown,
+        self.register_bot(BotCommand('mm', ('mm', 'murder'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.replace({'[': 'api_hypixel_player.player.stats.MurderMystery.'})
         ), lambda main, message: '''
             %s 的密室杀手数据:
@@ -1213,7 +1347,7 @@ class Main:
             'hypixel.name?', '[coins', '[wins', '[games', '[kills', '[deaths', '/',
             '[detective_chance', '[murderer_chance', '[bow_kills', '[knife_kills', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('tnt', ('tnt', 'tntgame', 'tntgames'), (Pipes.cooldown,
+        self.register_bot(BotCommand('tnt', ('tnt', 'tntgame', 'tntgames'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.replace({'[': 'api_hypixel_player.player.stats.TNTGames.'})
         ), lambda main, message: '''
             %s 的掘战游戏数据:
@@ -1232,7 +1366,7 @@ class Main:
             '[wins_bowspleef', '[deaths_bowspleef', '[wins_capture', '[assists_capture',
             '[kills_capture', '[deaths_capture', '/', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('pit', ('pit',), (Pipes.cooldown,
+        self.register_bot(BotCommand('pit', ('pit',), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.plus(
                 'api_hypixel_player.player.stats.Pit.pit_stats_ptl.kills', 'api_hypixel_player.player.stats.Pit.pit_stats_ptl.assists', 'pit.kill_and_assist'
             ), Pipes.replace({'[': 'api_hypixel_player.player.stats.Pit.pit_stats_ptl.', '(': 'api_hypixel_player.player.stats.Pit.profile.'})
@@ -1259,10 +1393,10 @@ class Main:
             '[tag?', 'guild.tag_color?', 'guild.double_exp', 'guild.double_coins', '[publiclyListed$', 'guild.preferred_games?'
         )
         self.register_bot(BotCommand('guildname', ('gname', 'guildname'), (Pipes.cooldown,
-            lambda main, message: Utils.set(message.data, 'guild.name', ' '.join(message.args[1:])),
+            lambda main, message: message.set('guild.name', ' '.join(message.args[1:])), APIs.RE_GUILDNAME,
             APIs.HYPIXEL_GUILD_NAME, Pipes.command_guild('name'), Pipes.replace({'[': 'api_hypixel_guild_name.guild.'})
         ), message_guild))
-        self.register_bot(BotCommand('guild', ('g', 'guild'), (Pipes.cooldown,
+        self.register_bot(BotCommand('guild', ('g', 'guild'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_GUILD_PLAYER, Pipes.command_guild('player'), Pipes.command_guild_player,
             Pipes.replace({'[': 'api_hypixel_guild_player.guild.'})
         ), lambda main, message: ('''
@@ -1274,7 +1408,7 @@ class Main:
             'api_mojang_profile.name?', 'guild.player.rank?', 'guild.player.questParticipation', 'guild.player.joined*?',
             'guild.player.exp.0', 'guild.player.exp.1', 'guild.player.exp.2', 'guild.player.exp.3', 'guild.player.exp.4', 'guild.player.exp.5', 'guild.player.exp.6'
         )) + message_guild(main, message)))
-        self.register_bot(BotCommand('bwshop', ('bwshop', 'bwfav'), (Pipes.cooldown,
+        self.register_bot(BotCommand('bwshop', ('bwshop', 'bwfav'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.command_bedwars
         ), lambda main, message: '''
             [%s%s] %s 的起床战争商店:
@@ -1283,22 +1417,24 @@ class Main:
         ''' % Utils.format(main, message,
             'bedwars.level?', 'bedwars.star?', 'hypixel.name?', 'bedwars.shop?', 'bedwars.slots?', 'hypixel.name_change?'
         )))
-        self.register_bot(BotCommand('denick', ('denick',), (Pipes.cooldown,
+        self.register_bot(BotCommand('denick', ('denick',), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.ANTISNIPER_DENICK, Pipes.replace({'[': 'api_antisniper_denick.player.'})
         ), lambda main, message: '''
             %s -> %s
             查询的 Nick: %s
             Denick 时间: %s
             上次发现: %s
+            (数据来自 Antisniper)
         ''' % Utils.format(main, message, '[ign?', '[latest_nick?', '[queried_nick?', '[first_detected~?', '[last_seen~?')))
-        self.register_bot(BotCommand('findnick', ('findnick',), (Pipes.cooldown,
+        self.register_bot(BotCommand('findnick', ('findnick',), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.ANTISNIPER_FINDNICK, Pipes.replace({'[': 'api_antisniper_findnick.player.'})
         ), lambda main, message: '''
             %s -> %s
             Denick 时间: %s
             上次发现: %s
+            (数据来自 Antisniper)
         ''' % Utils.format(main, message, '[ign?', '[nick?', '[first_detected~?', '[last_seen~?')))
-        self.register_bot(BotCommand('winstreak', ('ws', 'winstreak'), (Pipes.cooldown,
+        self.register_bot(BotCommand('winstreak', ('ws', 'winstreak'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.ANTISNIPER_WINSTREAK, Pipes.replace({'(': 'api_antisniper_winstreak.player.', '[': 'api_antisniper_winstreak.player.data.', ']': '_winstreak'})
         ), lambda main, message: '''
             %s 的起床战争连胜数据:
@@ -1308,8 +1444,9 @@ class Main:
             3v3v3v3: %s
             4v4v4v4: %s
             (4v4: %s)
+            (数据来自 Antisniper)
         ''' % Utils.format(main, message, '(ign?', '[overall]?', '[eight_one]?', '[eight_two]?', '[four_three]?', '[four_four]?', '[two_four]?')))
-        self.register_bot(BotCommand('winstreakall', ('wsall', 'winstreakall'), (Pipes.cooldown,
+        self.register_bot(BotCommand('winstreakall', ('wsall', 'winstreakall'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.ANTISNIPER_WINSTREAK, Pipes.replace({
                 '(': 'api_antisniper_winstreak.player.',
                 '[': 'api_antisniper_winstreak.player.data.eight_two_',
@@ -1317,6 +1454,7 @@ class Main:
                 ']': '_winstreak'
         })), lambda main, message: '''
             %s 的起床战争连胜数据:
+            (总连胜: %s)
             4v4: %s
             40v40 城池攻防战: %s
             双人疾速模式: %s
@@ -1333,8 +1471,56 @@ class Main:
             4v4v4v4 Underworld 模式: %s
             双人交换模式: %s
             4v4v4v4 交换模式: %s
+            (数据来自 Antisniper)
         ''' % Utils.format(main, message,
-            '(ign?', '(data.two_four]?', '(data.castle]?', '[rush]?', '<rush]?',
+            '(ign?', '(data.overall]?', '(data.two_four]?', '(data.castle]?', '[rush]?', '<rush]?',
+            '[ultimate]?', '<ultimate]?', '[armed]?', '<armed]?', '[lucky]?', '<lucky]?',
+            '[voidless]?', '<voidless]?', '[underworld]?', '<underworld]?', '[swap]?', '<swap]?'
+        )))
+        self.register_bot(BotCommand('winstreakhypixel', ('wshyp', ), (Pipes.cooldown, APIs.RE_USERNAME,
+            APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.replace({
+                '(': 'api_hypixel_player.player.',
+                '[': 'api_hypixel_player.player.stats.Bedwars.',
+                ']': '_winstreak'
+        })), lambda main, message: '''
+            %s 的起床战争连胜数据:
+            总连胜: %s
+            单人模式: %s
+            双人模式: %s
+            3v3v3v3: %s
+            4v4v4v4: %s
+            (4v4: %s)
+            (数据来自 Hypixel)
+        ''' % Utils.format(main, message, '(displayname?', '[winstreak?', '[eight_one]?', '[eight_two]?', '[four_three]?', '[four_four]?', '[two_four]?')))
+        self.register_bot(BotCommand('winstreakallhypixel', ('wsallhyp',), (Pipes.cooldown, APIs.RE_USERNAME,
+            APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.replace({
+                '(': 'api_hypixel_player.player.',
+                ':': 'api_hypixel_player.player.stats.Bedwars.',
+                '[': 'api_hypixel_player.player.stats.Bedwars.eight_two_',
+                '<': 'api_hypixel_player.player.stats.Bedwars.four_four_',
+                ']': '_winstreak'
+        })), lambda main, message: '''
+            %s 的起床战争连胜数据:
+            (总连胜: %s)
+            4v4: %s
+            40v40 城池攻防战: %s
+            双人疾速模式: %s
+            4v4v4v4 疾速模式: %s
+            双人超能力模式: %s
+            4v4v4v4 超能力模式: %s
+            双人枪战模式: %s
+            4v4v4v4 枪战模式: %s
+            双人幸运方块模式: %s
+            4v4v4v4 幸运方块模式: %s
+            双人无虚空模式: %s
+            4v4v4v4 无虚空模式: %s
+            双人 Underworld 模式: %s
+            4v4v4v4 Underworld 模式: %s
+            双人交换模式: %s
+            4v4v4v4 交换模式: %s
+            (数据来自 Hypixel)
+        ''' % Utils.format(main, message,
+            '(displayname?', ':winstreak?', ':two_four]?', ':castle]?', '[rush]?', '<rush]?',
             '[ultimate]?', '<ultimate]?', '[armed]?', '<armed]?', '[lucky]?', '<lucky]?',
             '[voidless]?', '<voidless]?', '[underworld]?', '<underworld]?', '[swap]?', '<swap]?'
         )))
@@ -1348,7 +1534,7 @@ class Main:
             for command in bot.commands:
                 commands[command] = bot
             return commands
-        self.register_bot(BotCommand('hypixel', ('hyp', 'hypixel'), (
+        self.register_bot(BotCommand('hypixel', ('hyp', 'hypixel'), (APIs.RE_USERNAME,
             pipe_command({
                 **command_bot('hypixelinternal'),
                 **command_bot('bedwars'),
@@ -1365,15 +1551,32 @@ class Main:
                 **command_bot('denick'),
                 **command_bot('findnick'),
                 **command_bot('winstreak'),
-                **command_bot('winstreakall')
+                **command_bot('winstreakall'),
+                **command_bot('winstreakhypixel'),
+                **command_bot('winstreakallhypixel'),
             }),
         ), lambda main, message:
-            Utils.get(message.data, f'commands.{Utils.get(message.data, "args.2", "__hypixelinternal")}', BotError(BotException('未知的指令!'))).process(main, Message(main,
+            message.get(f'commands.{message.get("args.2", "__hypixelinternal")}', BotError(BotException('未知的指令!'))).process(main, Message(main,
                 group=message.group, user=message.user, id=message.id, raw_message=
-                    f'{Consts.PREFIX}{Utils.get(message.data, "args.2", "__hypixelinternal")} {Utils.get(message.data, "args.1", "?")} ' +
+                    f'{Consts.PREFIX}{message.get("args.2", "__hypixelinternal")} {message.get("args.1", "?")} ' +
                     ' '.join(message.args[3:])
             ))
         ))
+        self.register_bot(BotCommand('optifinecape', ('ofcape', 'optifine'), (Pipes.cooldown, APIs.RE_USERNAME,
+            APIs.MOJANG_PROFILE, APIs.OPTIFINE_CAPE, APIs.OPTIFINE_FORMAT, Pipes.command_optifine_cape,
+        ), lambda main, message: '''
+            %s 的 OptiFine 披风信息:
+            Design: %s%s
+            Top: %s
+            Bottom: %s%s
+        ''' % Utils.format(main, message,
+            'api_mojang_profile.name?', 'ofcape.design?', 'ofcape.banner?', 'ofcape.top?', 'ofcape.bottom?', 'ofcape.custom?'
+        )))
+        self.register_bot(BotCommand('qqapi', ('qqapi',), (Pipes.cooldown, APIs.RE_QQNUMBER, APIs.QQAPI_QQAPI), lambda main, message: '''
+            %s 的 QQ 账号信息:
+            手机号: %s
+            地区: %s
+        ''' % Utils.format(main, message, 'api_qqapi_qqapi.qq?', 'api_qqapi_qqapi.phone?', 'api_qqapi_qqapi.phonediqu?')))
     def register_bot(self, bot):
         self.bot_map[bot.name] = bot
         if self.options.get(f'bots.{bot.name}') is None:
@@ -1461,6 +1664,13 @@ class Main:
                 return False, ''
             elif command == 'cmd':
                 return self.command(self.options.get(f'options.admin.commands.{args[0]}', 'Love Q_TT'), group, user)
+            elif command == 'reset':
+                location = eval(args[0])
+                self.options.set(location, Utils.get(self.options.default_options, location))
+                return False, 'Reset Success!'
+            elif command == 'setfrom':
+                self.options.set(eval(args[0]), self.options.get(eval(args[1]) if len(args) >= 2 else self.record_messages['']))
+                return False, 'SetFrom Success!'
             else:
                 return False, 'Unknown Command.'
         except Exception:
