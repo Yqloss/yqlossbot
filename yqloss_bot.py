@@ -852,7 +852,9 @@ class Pipes:
         return _
     @staticmethod
     def session(main, message):
+        uuid = message.get('api_mojang_session.id', '?' * 32)
         properties = message.get('api_mojang_session.properties', [])
+        message.set('session.id_dashed', f'{uuid[:8]}-{uuid[8:12]}-{uuid[12:16]}-{uuid[16:20]}-{uuid[20:]}')
         for property in properties:
             if property.get('name', '') == 'textures':
                 value = json.loads(base64.b64decode(property.get('value', '')).decode())
@@ -991,14 +993,16 @@ class Pipes:
             message.set('guild.preferred_games', ', '.join([Utils.string_to_camel(game) for game in preferred_games]) if preferred_games else '无')
         return _
     @staticmethod
-    def command_guild_player(main, message):
-        members = message.get(f'api_hypixel_guild_player.guild.members', [])
-        uuid = message.get('api_mojang_profile.id', 'Love')
-        for member in members:
-            if member.get('uuid', 'Q_TT') == uuid:
-                message.set('guild.player', member)
-                message.set('guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
-                break
+    def command_guild_player(api):
+        def _(main, message):
+            members = message.get(f'api_hypixel_guild_{api}.guild.members', [])
+            uuid = message.get('api_mojang_profile.id', 'Love')
+            for member in members:
+                if member.get('uuid', 'Q_TT') == uuid or (member.get('rank', 'CUTE') == 'Guild Master' and uuid == 'Love'):
+                    message.set('guild.player', member)
+                    message.set('guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
+                    break
+        return _
     @staticmethod
     def _check_valign(main, message, valign, binary):
         message.set('ofcape.valign', valign)
@@ -1044,6 +1048,7 @@ class APIs:
     MOJANG_SESSION_NAME = Pipes.api('mojang_session', None, 'id', 'api_mojang_profile.id')
     MOJANG_SESSION_UUID = Pipes.api('mojang_session', None, 'id', 'args.1')
     MOJANG_SESSION_HYPIXEL_API = Pipes.api('mojang_session', None, 'id', 'api_hypixel_key.record.owner')
+    MOJANG_SESSION_HYPIXEL_GUILDNAME = Pipes.api('mojang_session', None, 'id', 'guild.player.uuid')
     HYPIXEL_API = Pipes.api('hypixel_key', 'success', 'record', 'apiset.hypixel_apikey')
     HYPIXEL_PUNISHMENTSTATS = Pipes.api('hypixel_punishmentstats', 'success', 'staff_total', 'apiset.hypixel_apikey')
     HYPIXEL_PLAYER = Pipes.api('hypixel_player', 'success', 'player', 'apiset.hypixel_apikey', 'api_mojang_profile.id')
@@ -1101,9 +1106,6 @@ class Main:
                 },
                 'qqapi': {
                     'lists': ['admin']
-                },
-                'optifinecape': {
-                    'lists': ['admin']
                 }
             },
             'global': {
@@ -1160,16 +1162,6 @@ class Main:
         })
         self.bot_map = {}
         self.register_bot(BotCommand('admin', ('',), (), lambda main, message: main.command(message.message[2:], message.group, message.user)[1]))
-        message_profile = lambda main, message: '''
-            名称: %s
-            UUID: %s
-            皮肤模型: %s
-            皮肤: %s
-            披风: %s
-        ''' % Utils.format(main, message,
-            'api_mojang_session.name?', 'api_mojang_session.id?',
-            'session.model?', 'session.skin?', 'session.cape?'
-        )
         self.register_bot(BotCommand('help', ('help', 'yhelp'), (Pipes.cooldown,), lambda main, message: '''
             Yqloss 机器人指令列表:
             %shelp|yhelp 显示指令列表
@@ -1197,7 +1189,8 @@ class Main:
             %swsall|winstreakall <玩家> 查询起床战争其他模式连胜 (Antisniper)
             %swshyp <玩家> 查询起床战争普通模式连胜 (Hypixel)
             %swsallhyp <玩家> 查询起床战争其他模式连胜 (Hypixel)
-        ''' % Utils.format(main, message, *(25 * ('prefix',)))))
+            %sofcape|optifine <玩家> 查询 OptiFine 披风
+        ''' % Utils.format(main, message, *(26 * ('prefix',)))))
         def current_time():
             time_ = time.localtime()
             return time_.tm_yday * 191981 + time_.tm_year * 1145
@@ -1208,6 +1201,17 @@ class Main:
             f'{message.at()}你今天的幸运值是 {random.randint(message.get("luck.from", 0), message.get("luck.to", 100))}%!'
         )))
         self.register_bot(BotAutoreply('autoreply'))
+        message_profile = lambda main, message: '''
+            名称: %s
+            UUID: %s
+            UU-ID: %s
+            皮肤模型: %s
+            皮肤: %s
+            披风: %s
+        ''' % Utils.format(main, message,
+            'api_mojang_session.name?', 'api_mojang_session.id?',
+            'session.id_dashed?', 'session.model?', 'session.skin?', 'session.cape?'
+        )
         self.register_bot(BotCommand('mcname', ('mc', 'minecraft', 'profile', 'skin', 'mcskin'), (Pipes.cooldown, APIs.RE_USERNAME, APIs.MOJANG_PROFILE, APIs.MOJANG_SESSION_NAME, Pipes.session), message_profile))
         self.register_bot(BotCommand('mcuuid', ('mcuuid', 'uuid'), (Pipes.cooldown, APIs.RE_UUID, APIs.MOJANG_SESSION_UUID, Pipes.session), message_profile))
         self.register_bot(BotCommand('hypixelinternal', ('__hypixelinternal',), (Pipes.cooldown, APIs.RE_USERNAME,
@@ -1397,10 +1401,19 @@ class Main:
         )
         self.register_bot(BotCommand('guildname', ('gname', 'guildname'), (Pipes.cooldown,
             lambda main, message: message.set('guild.name', ' '.join(message.args[1:])), APIs.RE_GUILDNAME,
-            APIs.HYPIXEL_GUILD_NAME, Pipes.command_guild('name'), Pipes.replace({'[': 'api_hypixel_guild_name.guild.'})
-        ), message_guild))
+            APIs.HYPIXEL_GUILD_NAME, Pipes.command_guild('name'), Pipes.command_guild_player('name'), APIs.MOJANG_SESSION_HYPIXEL_GUILDNAME,
+            Pipes.replace({'[': 'api_hypixel_guild_name.guild.'})
+        ), lambda main, message: message_guild(main, message) + '''
+            会长: %s | 完成挑战: %s
+            加入时间: %s
+            近 7 天经验: %s %s %s %s %s %s %s
+        ''' % Utils.format(main, message,
+            'api_mojang_session.name?', 'guild.player.questParticipation', 'guild.player.joined*?',
+            'guild.player.exp.0', 'guild.player.exp.1', 'guild.player.exp.2', 'guild.player.exp.3',
+            'guild.player.exp.4', 'guild.player.exp.5', 'guild.player.exp.6'
+        )))
         self.register_bot(BotCommand('guild', ('g', 'guild'), (Pipes.cooldown, APIs.RE_USERNAME,
-            APIs.MOJANG_PROFILE, APIs.HYPIXEL_GUILD_PLAYER, Pipes.command_guild('player'), Pipes.command_guild_player,
+            APIs.MOJANG_PROFILE, APIs.HYPIXEL_GUILD_PLAYER, Pipes.command_guild('player'), Pipes.command_guild_player('player'),
             Pipes.replace({'[': 'api_hypixel_guild_player.guild.'})
         ), lambda main, message: ('''
             %s 的公会信息:
@@ -1409,7 +1422,8 @@ class Main:
             近 7 天经验: %s %s %s %s %s %s %s
         ''' % Utils.format(main, message,
             'api_mojang_profile.name?', 'guild.player.rank?', 'guild.player.questParticipation', 'guild.player.joined*?',
-            'guild.player.exp.0', 'guild.player.exp.1', 'guild.player.exp.2', 'guild.player.exp.3', 'guild.player.exp.4', 'guild.player.exp.5', 'guild.player.exp.6'
+            'guild.player.exp.0', 'guild.player.exp.1', 'guild.player.exp.2', 'guild.player.exp.3',
+            'guild.player.exp.4', 'guild.player.exp.5', 'guild.player.exp.6'
         )) + message_guild(main, message)))
         self.register_bot(BotCommand('bwshop', ('bwshop', 'bwfav'), (Pipes.cooldown, APIs.RE_USERNAME,
             APIs.MOJANG_PROFILE, APIs.HYPIXEL_PLAYER, Pipes.hypixel, Pipes.command_bedwars
@@ -1666,7 +1680,10 @@ class Main:
                 self.recall_mode = (group, user)
                 return False, ''
             elif command == 'cmd':
-                return self.command(self.options.get(f'options.admin.commands.{args[0]}', 'Love Q_TT'), group, user)
+                cmd = self.options.get(f'options.admin.commands.{args[0]}', 'Love Q_TT')
+                for i, arg in enumerate(args):
+                    cmd = cmd.replace(f'{{arg_{i}}}', arg)
+                return self.command(cmd, group, user)
             elif command == 'reset':
                 location = eval(args[0])
                 self.options.set(location, Utils.get(self.options.default_options, location))
