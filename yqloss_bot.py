@@ -8,6 +8,7 @@ import time
 import traceback
 import base64
 import random
+import sys
 from io import BytesIO
 from PIL import Image
 class Consts:
@@ -41,8 +42,13 @@ class Utils:
         return buffer
     @staticmethod
     def _send(url):
-        json_obj = json.loads(requests.get(url, headers={'Host': Consts.ADDRESS_SEND_HOST}).content.decode())
-        return json_obj.get('message_id', 0)
+        response = requests.get(url, headers={'Host': Consts.ADDRESS_SEND_HOST})
+        if response.status_code != 200:
+            traceback.print_stack()
+            print(f'Send Message Error (HTTP {response.status_code})!', file=sys.stderr)
+            print(f'(URL: {url})', file=sys.stderr)
+        json_obj = json.loads(response.content.decode())
+        return json_obj.get('data', {}).get('message_id', 0)
     @staticmethod
     def send_private(number, message):
         if not message: return
