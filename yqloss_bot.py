@@ -48,7 +48,10 @@ class Utils:
             print(f'Send Message Error (HTTP {response.status_code})!', file=sys.stderr)
             print(f'(URL: {url})', file=sys.stderr)
         json_obj = json.loads(response.content.decode())
-        return json_obj.get('data', {}).get('message_id', 0)
+        data = json_obj.get('data', {})
+        if isinstance(data, dict):
+            return data.get('message_id', 0)
+        return 0
     @staticmethod
     def send_private(number, message):
         if not message: return
@@ -879,7 +882,7 @@ class Pipes:
     @staticmethod
     def hypixel(main, message):
         uuid = message.get('api_mojang_profile.id')
-        username = message.get('api_hypixel_player.player.displayname')
+        username = message.get('api_hypixel_player.player.displayname', '无')
         username_mojang = message.get('api_mojang_profile.name')
         custom_rank = main.options.get(f'options.hypixel.ranks.{uuid}')
         rank = ''
@@ -901,7 +904,7 @@ class Pipes:
             rank, rank_raw = Maps.RANK[rank_package], rank_package
         if custom_rank is not None:
             rank = custom_rank.replace('{rank}', rank)
-        message.set('hypixel.name', rank + username)
+        message.set('hypixel.name', rank + username_mojang)
         message.set('hypixel.rank_raw', rank_raw)
         if username != username_mojang:
             message.set('hypixel.name_change', f'\n此玩家已改名! ({username} -> {username_mojang})')
@@ -1002,10 +1005,16 @@ class Pipes:
     def command_guild_player(api):
         def _(main, message):
             members = message.get(f'api_hypixel_guild_{api}.guild.members', [])
+            groups = message.get(f'api_hypixel_guild_{api}.guild.ranks', [])
+            group_map = {x.get('name', '?').lower(): x.get('tag') for x in groups}
             uuid = message.get('api_mojang_profile.id', 'Love')
             for member in members:
-                if member.get('uuid', 'Q_TT') == uuid or (member.get('rank', 'CUTE') == 'Guild Master' and uuid == 'Love'):
+                rank = member.get('rank', '###CUTE###').lower()
+                if member.get('uuid', 'Q_TT') == uuid or (rank not in group_map and uuid == 'Love'):
+                    tag = group_map.get(rank)
+                    if tag is None: tag = 'GM'
                     message.set('guild.player', member)
+                    message.set('guild.player.tag', f' [{tag}]' if tag else '')
                     message.set('guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
                     break
         return _
@@ -1423,11 +1432,12 @@ class Main:
             Pipes.replace({'[': 'api_hypixel_guild_player.guild.'})
         ), lambda main, message: ('''
             %s 的公会信息:
-            权限组: %s | 完成挑战: %s
+            权限组: %s%s | 完成挑战: %s
             加入时间: %s
             近 7 天经验: %s %s %s %s %s %s %s
         ''' % Utils.format(main, message,
-            'api_mojang_profile.name?', 'guild.player.rank?', 'guild.player.questParticipation', 'guild.player.joined*?',
+            'api_mojang_profile.name?', 'guild.player.rank?', 'guild.player.tag?',
+            'guild.player.questParticipation', 'guild.player.joined*?',
             'guild.player.exp.0', 'guild.player.exp.1', 'guild.player.exp.2', 'guild.player.exp.3',
             'guild.player.exp.4', 'guild.player.exp.5', 'guild.player.exp.6'
         )) + message_guild(main, message)))
