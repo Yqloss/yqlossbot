@@ -1011,8 +1011,8 @@ class Pipes:
             for member in members:
                 rank = member.get('rank', '###CUTE###').lower()
                 if member.get('uuid', 'Q_TT') == uuid or (rank not in group_map and uuid == 'Love'):
-                    tag = group_map.get(rank)
-                    if tag is None: tag = 'GM'
+                    tag = group_map.get(rank, '[]ILoveQ_TTForever')
+                    if tag == '[]ILoveQ_TTForever': tag = 'GM'
                     message.set('guild.player', member)
                     message.set('guild.player.tag', f' [{tag}]' if tag else '')
                     message.set('guild.player.exp', dict(zip(map(str, range(7)), map(lambda x: x[1], sorted(member.get('expHistory', {}).items(), key=lambda x: x[0])))))
